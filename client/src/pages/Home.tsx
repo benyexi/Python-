@@ -1,11 +1,48 @@
-import { useState, useCallback } from "react";
-import { trpc } from "@/lib/trpc";
+import { useState, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Play, RotateCcw, Code2, Zap, History, PanelRightClose, PanelRightOpen } from "lucide-react";
 import CodeEditor from "@/components/CodeEditor";
 import OutputPanel from "@/components/OutputPanel";
 import HistoryPanel, { HistoryEntry } from "@/components/HistoryPanel";
+
+declare global {
+  interface Window {
+    loadPyodide?: (options?: { indexURL?: string }) => Promise<PyodideRuntime>;
+  }
+}
+
+type PyodideRuntime = {
+  globals: {
+    set: (name: string, value: unknown) => void;
+    get: (name: string) => unknown;
+    delete: (name: string) => void;
+  };
+  runPythonAsync: (code: string) => Promise<unknown>;
+};
+
+const PYODIDE_CDN = "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/";
+
+function loadPyodideScript() {
+  if (window.loadPyodide) return Promise.resolve();
+
+  return new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>("script[data-pyodide]");
+    if (existing) {
+      existing.addEventListener("load", () => resolve(), { once: true });
+      existing.addEventListener("error", () => reject(new Error("Failed to load Pyodide")), { once: true });
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = `${PYODIDE_CDN}pyodide.js`;
+    script.async = true;
+    script.dataset.pyodide = "true";
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load Pyodide"));
+    document.head.appendChild(script);
+  });
+}
 
 const CODE_EXAMPLES: Record<string, { label: string; code: string }> = {
   hello: {
@@ -165,6 +202,9 @@ export default function Home() {
   const [stderr, setStderr] = useState("");
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [hasRun, setHasRun] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
+  const [runtimeStatus, setRuntimeStatus] = useState("Python in browser");
+  const pyodideRef = useRef<Promise<PyodideRuntime> | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>(() => {
     try {
       const saved = localStorage.getItem("pyexec-history");
@@ -175,43 +215,99 @@ export default function Home() {
   });
   const [showHistory, setShowHistory] = useState(false);
 
-  const executeMutation = trpc.python.execute.useMutation({
-    onSuccess: (data) => {
-      setStdout(data.stdout);
-      setStderr(data.stderr);
-      setExitCode(data.exitCode);
-      setHasRun(true);
-
-      // Add to history
-      const entry: HistoryEntry = {
-        id: data.executionId,
-        code,
-        stdout: data.stdout,
-        stderr: data.stderr,
-        exitCode: data.exitCode,
-        timestamp: Date.now(),
-      };
-      setHistory((prev) => {
-        const updated = [entry, ...prev].slice(0, 50); // Keep last 50
-        try {
-          localStorage.setItem("pyexec-history", JSON.stringify(updated));
-        } catch {}
-        return updated;
-      });
-    },
-    onError: (error) => {
-      setStdout("");
-      setStderr(error.message);
-      setExitCode(1);
-      setHasRun(true);
-    },
-  });
-
-  const handleRun = useCallback(() => {
-    if (code.trim() && !executeMutation.isPending) {
-      executeMutation.mutate({ code });
+  const getPyodide = useCallback(() => {
+    if (!pyodideRef.current) {
+      pyodideRef.current = (async () => {
+        setRuntimeStatus("Loading Python runtime...");
+        await loadPyodideScript();
+        if (!window.loadPyodide) {
+          throw new Error("Pyodide loader is unavailable");
+        }
+        const runtime = await window.loadPyodide({ indexURL: PYODIDE_CDN });
+        setRuntimeStatus("Python ready");
+        return runtime;
+      })();
     }
-  }, [code, executeMutation]);
+    return pyodideRef.current;
+  }, []);
+
+  const saveHistoryEntry = useCallback((entry: HistoryEntry) => {
+    setHistory((prev) => {
+      const updated = [entry, ...prev].slice(0, 50);
+      try {
+        localStorage.setItem("pyexec-history", JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+  }, []);
+
+  const handleRun = useCallback(async () => {
+    if (!code.trim() || isRunning) return;
+
+    setIsRunning(true);
+    setStdout("");
+    setStderr("");
+    setExitCode(null);
+    setHasRun(true);
+
+    try {
+      const pyodide = await getPyodide();
+      pyodide.globals.set("USER_CODE", code);
+      await pyodide.runPythonAsync(`
+import contextlib
+import io
+import traceback
+
+_stdout = io.StringIO()
+_stderr = io.StringIO()
+_exit_code = 0
+
+try:
+    with contextlib.redirect_stdout(_stdout), contextlib.redirect_stderr(_stderr):
+        exec(USER_CODE, {})
+except SystemExit as exc:
+    _exit_code = exc.code if isinstance(exc.code, int) else 0
+except Exception:
+    _exit_code = 1
+    traceback.print_exc(file=_stderr)
+
+STDOUT = _stdout.getvalue()
+STDERR = _stderr.getvalue()
+EXIT_CODE = _exit_code
+`);
+
+      const result = {
+        stdout: String(pyodide.globals.get("STDOUT") ?? ""),
+        stderr: String(pyodide.globals.get("STDERR") ?? ""),
+        exitCode: Number(pyodide.globals.get("EXIT_CODE") ?? 0),
+        executionId: crypto.randomUUID(),
+      };
+
+      pyodide.globals.delete("USER_CODE");
+      pyodide.globals.delete("STDOUT");
+      pyodide.globals.delete("STDERR");
+      pyodide.globals.delete("EXIT_CODE");
+
+      setStdout(result.stdout);
+      setStderr(result.stderr);
+      setExitCode(result.exitCode);
+      saveHistoryEntry({
+        id: result.executionId,
+        code,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        timestamp: Date.now(),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStdout("");
+      setStderr(message);
+      setExitCode(1);
+    } finally {
+      setIsRunning(false);
+    }
+  }, [code, getPyodide, isRunning, saveHistoryEntry]);
 
   const handleClear = useCallback(() => {
     setCode("");
@@ -316,12 +412,12 @@ export default function Home() {
           <Button
             size="sm"
             onClick={handleRun}
-            disabled={executeMutation.isPending || !code.trim()}
+            disabled={isRunning || !code.trim()}
             className={`h-8 px-4 text-xs font-semibold bg-primary text-primary-foreground hover:bg-primary/90 transition-all duration-160 active:scale-[0.97] ${
-              !executeMutation.isPending && code.trim() ? "animate-pulse-glow" : ""
+              !isRunning && code.trim() ? "animate-pulse-glow" : ""
             }`}
           >
-            {executeMutation.isPending ? (
+            {isRunning ? (
               <>
                 <Zap className="w-3.5 h-3.5 mr-1 animate-pulse" />
                 Running...
@@ -364,7 +460,7 @@ export default function Home() {
             <OutputPanel
               stdout={stdout}
               stderr={stderr}
-              isRunning={executeMutation.isPending}
+              isRunning={isRunning}
               exitCode={exitCode}
               hasRun={hasRun}
             />
@@ -386,7 +482,7 @@ export default function Home() {
       {/* Footer */}
       <footer className="flex items-center justify-between px-4 sm:px-6 py-1.5 border-t border-border bg-[oklch(0.12_0.01_250)] relative z-10">
         <span className="text-[11px] text-muted-foreground/50 font-mono">
-          Python 3.11 | 10s timeout | 1MB output limit
+          {runtimeStatus} | Runs locally in your browser
         </span>
         <span className="text-[11px] text-muted-foreground/50 font-mono hidden sm:inline">
           Powered by PyExec
